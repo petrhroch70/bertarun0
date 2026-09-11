@@ -1,616 +1,537 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { ENEMIES, ROOMS, STORY_INTRO, STORY_MIDPOINTS } from './gameData';
 import type { Enemy, Bullet, GameItem } from './gameData';
-import { playMelody, stopMelody, playSfx, setVolume, initAudio } from './audio';
+// Audio is handled inline below
 
-// ===== TYPES =====
-type GameState = 'title' | 'intro' | 'overworld' | 'battle' | 'gameover' | 'ending';
-type BattlePhase = 'menu' | 'act' | 'item' | 'enemy_turn' | 'dialogue' | 'victory' | 'transition';
+// ===== AUDIO (simple, optional) =====
+let audioCtx: AudioContext | null = null;
+let melodyTimer: number | null = null;
+let audioGain: GainNode | null = null;
 
-interface PlayerState {
-  hp: number;
-  maxHp: number;
-  atk: number;
-  def: number;
-  lv: number;
-  exp: number;
-  gold: number;
+function initAudioCtx() {
+  if (audioCtx) return;
+  try {
+    const AC = window.AudioContext || (window as any).webkitAudioContext;
+    if (!AC) return;
+    audioCtx = new AC();
+    audioGain = audioCtx.createGain();
+    audioGain.connect(audioCtx.destination);
+    audioGain.gain.value = 0.25;
+  } catch (e) { /* audio not available */ }
 }
 
-// ===== CONSTANTS =====
-const BERT_MAX_HP = 92;
-const BERT_ATK = 12;
-const BERT_DEF = 8;
+function beep(freq: number, dur: number, type: OscillatorType = 'square') {
+  if (!audioCtx || !audioGain) return;
+  try {
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+    const osc = audioCtx.createOscillator();
+    const g = audioCtx.createGain();
+    osc.type = type;
+    osc.frequency.value = freq;
+    g.gain.setValueAtTime(0.2, audioCtx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + dur);
+    osc.connect(g);
+    g.connect(audioGain);
+    osc.start();
+    osc.stop(audioCtx.currentTime + dur);
+  } catch (e) { /* ignore */ }
+}
 
-// ===== MAIN COMPONENT =====
+const MELODIES: Record<string, number[]> = {
+  menu: [330, 392, 440, 523, 440, 392, 330, 294],
+  overworld: [262, 294, 330, 349, 392, 349, 330, 294],
+  battle: [392, 392, 440, 392, 523, 494, 392, 440],
+  boss: [196, 233, 262, 196, 233, 262, 330, 294],
+  victory: [523, 523, 523, 523, 659, 659, 784, 784],
+};
+
+function playMelody(name: string) {
+  stopMelody();
+  const notes = MELODIES[name];
+  if (!notes) return;
+  let i = 0;
+  const play = () => {
+    beep(notes[i % notes.length], 0.15, 'square');
+    i++;
+    melodyTimer = window.setTimeout(play, 200);
+  };
+  play();
+}
+
+function stopMelody() {
+  if (melodyTimer) { clearTimeout(melodyTimer); melodyTimer = null; }
+}
+
+function sfx(name: string) {
+  if (!audioCtx) return;
+  switch (name) {
+    case 'select': beep(440, 0.05); break;
+    case 'confirm': beep(523, 0.05); setTimeout(() => beep(659, 0.05), 50); break;
+    case 'hurt': beep(200, 0.1, 'sawtooth'); break;
+    case 'heal': beep(523, 0.1, 'sine'); setTimeout(() => beep(784, 0.1, 'sine'), 100); break;
+    case 'attack': beep(300, 0.05, 'sawtooth'); setTimeout(() => beep(600, 0.05, 'sawtooth'), 50); break;
+  }
+}
+
+// ===== TYPES =====
+type Screen = 'title' | 'intro' | 'overworld' | 'battle' | 'gameover' | 'ending';
+type BPhase = 'menu' | 'act' | 'item' | 'enemy' | 'dialogue' | 'victory' | 'wait';
+
+// ===== MAIN =====
 export default function App() {
-  const [gameState, setGameState] = useState<GameState>('title');
-  const [introIndex, setIntroIndex] = useState(0);
-  const [currentRoom, setCurrentRoom] = useState('classroom');
-  const [dialogue, setDialogue] = useState<string[]>([]);
-  const [dialogueIndex, setDialogueIndex] = useState(0);
-  const [inventory, setInventory] = useState<GameItem[]>([]);
-  const [player, setPlayer] = useState<PlayerState>({
-    hp: BERT_MAX_HP, maxHp: BERT_MAX_HP, atk: BERT_ATK, def: BERT_DEF, lv: 1, exp: 0, gold: 0,
-  });
-  const [currentEnemy, setCurrentEnemy] = useState<Enemy | null>(null);
-  const [battlePhase, setBattlePhase] = useState<BattlePhase>('menu');
-  const [menuSelection, setMenuSelection] = useState(0);
-  const [battleLog, setBattleLog] = useState<string[]>([]);
+  const [screen, setScreen] = useState<Screen>('title');
+  const [introIdx, setIntroIdx] = useState(0);
+  const [room, setRoom] = useState('classroom');
+  const [dlg, setDlg] = useState<string[]>([]);
+  const [dlgIdx, setDlgIdx] = useState(0);
+  const [inv, setInv] = useState<GameItem[]>([]);
+  const [hp, setHp] = useState(92);
+  const [lv, setLv] = useState(1);
+  const [exp, setExp] = useState(0);
+  const [gold, setGold] = useState(0);
+  const [enemy, setEnemy] = useState<Enemy | null>(null);
+  const [bp, setBp] = useState<BPhase>('menu');
+  const [menuSel, setMenuSel] = useState(0);
+  const [log, setLog] = useState<string[]>([]);
   const [bullets, setBullets] = useState<Bullet[]>([]);
-  const [playerPos, setPlayerPos] = useState({ x: 150, y: 100 });
-  const [isDodging, setIsDodging] = useState(false);
-  const [visitedRooms, setVisitedRooms] = useState<Set<string>>(new Set(['classroom']));
-  const [defeatedEnemies, setDefeatedEnemies] = useState<Set<string>>(new Set());
-  const [collectedItems, setCollectedItems] = useState<Set<string>>(new Set());
-  const [fightAnim, setFightAnim] = useState(false);
+  const [pos, setPos] = useState({ x: 150, y: 100 });
+  const [dodging, setDodging] = useState(false);
+  const [visited, setVisited] = useState<Set<string>>(new Set(['classroom']));
+  const [defeated, setDefeated] = useState<Set<string>>(new Set());
+  const [collected, setCollected] = useState<Set<string>>(new Set());
   const [shake, setShake] = useState(false);
-  const [dmgNum, setDmgNum] = useState<{ val: number } | null>(null);
   const [invincible, setInvincible] = useState(false);
-  const [audioOn, setAudioOn] = useState(false);
-  const [volume, setVol] = useState(0.3);
-  const [showMidpoint, setShowMidpoint] = useState(false);
-  const [midpointText, setMidpointText] = useState<string[]>([]);
-  const [midpointIdx, setMidpointIdx] = useState(0);
+  const [midpoint, setMidpoint] = useState(false);
+  const [midIdx, setMidIdx] = useState(0);
+  const [midText, setMidText] = useState<string[]>([]);
+  const [audioStarted, setAudioStarted] = useState(false);
 
   // Refs for game loop
-  const keysRef = useRef(new Set<string>());
-  const animRef = useRef<number>(0);
-  const dodgeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const enemyRef = useRef<Enemy | null>(null);
-  const playerPosRef = useRef(playerPos);
-  const invincibleRef = useRef(false);
-  const isDodgingRef = useRef(false);
+  const keys = useRef(new Set<string>());
+  const dodgingRef = useRef(false);
+  const posRef = useRef(pos);
+  const invRef = useRef(false);
+  const enemyRef = useRef(enemy);
 
-  // Keep refs in sync
-  useEffect(() => { playerPosRef.current = playerPos; }, [playerPos]);
-  useEffect(() => { invincibleRef.current = invincible; }, [invincible]);
-  useEffect(() => { isDodgingRef.current = isDodging; }, [isDodging]);
-  useEffect(() => { enemyRef.current = currentEnemy; }, [currentEnemy]);
+  useEffect(() => { dodgingRef.current = dodging; }, [dodging]);
+  useEffect(() => { posRef.current = pos; }, [pos]);
+  useEffect(() => { invRef.current = invincible; }, [invincible]);
+  useEffect(() => { enemyRef.current = enemy; }, [enemy]);
 
-  // ===== AUDIO =====
-  const startAudio = useCallback(() => {
-    if (!audioOn) {
-      initAudio();
-      setAudioOn(true);
-      playMelody('menu');
-    }
-  }, [audioOn]);
+  // Keyboard - stable handler using ref (ref is assigned after handleEnter is defined)
+  const handleEnterRef = useRef<() => void>(() => {});
 
-  // Music changes based on game state
-  useEffect(() => {
-    if (!audioOn) return;
-    if (gameState === 'title') {
-      stopMelody();
-    } else if (gameState === 'battle' && currentEnemy) {
-      if (currentEnemy.name.includes('Principal') || currentEnemy.name.includes('Matěj')) {
-        playMelody('boss');
-      } else {
-        playMelody('battle');
-      }
-    } else if (gameState === 'overworld') {
-      playMelody('overworld');
-    } else if (gameState === 'ending') {
-      playMelody('victory');
-    }
-  }, [gameState, currentEnemy, audioOn]);
-
-  // ===== GAME LOOP (Bullet Hell) =====
-  useEffect(() => {
-    if (!isDodging || gameState !== 'battle') return;
-
-    const loop = () => {
-      if (!isDodgingRef.current) return;
-
-      const speed = 4;
-      const keys = keysRef.current;
-      setPlayerPos(pos => {
-        let nx = pos.x, ny = pos.y;
-        if (keys.has('ArrowLeft') || keys.has('a')) nx -= speed;
-        if (keys.has('ArrowRight') || keys.has('d')) nx += speed;
-        if (keys.has('ArrowUp') || keys.has('w')) ny -= speed;
-        if (keys.has('ArrowDown') || keys.has('s')) ny += speed;
-        nx = Math.max(10, Math.min(290, nx));
-        ny = Math.max(10, Math.min(190, ny));
-        return { x: nx, y: ny };
-      });
-
-      setBullets(prev => prev.map(b => ({ ...b, x: b.x + b.vx, y: b.y + b.vy }))
-        .filter(b => b.x > -50 && b.x < 350 && b.y > -50 && b.y < 250));
-
-      // Collision
-      if (!invincibleRef.current) {
-        const pos = playerPosRef.current;
-        setBullets(prev => {
-          const hit = prev.some(b => {
-            const dx = b.x - pos.x;
-            const dy = b.y - pos.y;
-            return Math.sqrt(dx * dx + dy * dy) < (b.size + 8);
-          });
-          if (hit) {
-            const enemy = enemyRef.current;
-            const dmg = Math.max(1, (enemy?.atk || 5) - BERT_DEF);
-            setPlayer(p => {
-              const newHp = Math.max(0, p.hp - dmg);
-              if (newHp <= 0) {
-                setIsDodging(false);
-                setBullets([]);
-                setTimeout(() => {
-                  setGameState('gameover');
-                  stopMelody();
-                }, 300);
-              }
-              return { ...p, hp: newHp };
-            });
-            setShake(true);
-            setTimeout(() => setShake(false), 200);
-            playSfx('hurt');
-            setInvincible(true);
-            setTimeout(() => setInvincible(false), 800);
-          }
-          return prev;
-        });
-      }
-
-      animRef.current = requestAnimationFrame(loop);
-    };
-
-    animRef.current = requestAnimationFrame(loop);
-    return () => cancelAnimationFrame(animRef.current);
-  }, [isDodging, gameState]);
-
-  // ===== KEYBOARD =====
   useEffect(() => {
     const down = (e: KeyboardEvent) => {
-      keysRef.current.add(e.key);
-
-      if (gameState === 'title' && (e.key === 'Enter' || e.key === ' ')) {
+      keys.current.add(e.key);
+      if (e.key === 'Enter' || e.key === ' ') {
         e.preventDefault();
-        startAudio();
-        setGameState('intro');
-        playSfx('confirm');
+        handleEnterRef.current();
       }
-      if (gameState === 'intro' && (e.key === 'Enter' || e.key === ' ')) {
-        e.preventDefault();
-        playSfx('select');
-        if (introIndex < STORY_INTRO.length - 1) {
-          setIntroIndex(i => i + 1);
-        } else {
-          setGameState('overworld');
-        }
+      if (e.key === 'Escape') {
+        setBp(prev => (prev === 'act' || prev === 'item') ? 'menu' : prev);
       }
-      if (showMidpoint && (e.key === 'Enter' || e.key === ' ')) {
-        e.preventDefault();
-        playSfx('select');
-        if (midpointIdx < midpointText.length - 1) {
-          setMidpointIdx(i => i + 1);
-        } else {
-          setShowMidpoint(false);
-          beginBattle();
-        }
-      }
-      if (gameState === 'overworld' && dialogue.length > 0 && (e.key === 'Enter' || e.key === ' ')) {
-        e.preventDefault();
-        playSfx('select');
-        if (dialogueIndex < dialogue.length - 1) {
-          setDialogueIndex(i => i + 1);
-        } else {
-          setDialogue([]);
-          setDialogueIndex(0);
-        }
-      }
-      if (gameState === 'battle') {
-        handleBattleKey(e.key);
-      }
-      if (gameState === 'gameover' && (e.key === 'Enter' || e.key === ' ')) {
-        e.preventDefault();
-        restartGame();
-      }
-      if (gameState === 'ending' && (e.key === 'Enter' || e.key === ' ')) {
-        e.preventDefault();
-        setGameState('title');
-        stopMelody();
-      }
+      if (e.key === 'ArrowLeft') setMenuSel(s => Math.max(0, s - 1));
+      if (e.key === 'ArrowRight') setMenuSel(s => Math.min(3, s + 1));
     };
-    const up = (e: KeyboardEvent) => keysRef.current.delete(e.key);
-
+    const up = (e: KeyboardEvent) => keys.current.delete(e.key);
     window.addEventListener('keydown', down);
     window.addEventListener('keyup', up);
     return () => { window.removeEventListener('keydown', down); window.removeEventListener('keyup', up); };
-  });
+  }, []);
 
-  // ===== BATTLE LOGIC =====
-  const handleBattleKey = (key: string) => {
-    if (battlePhase === 'transition') return;
+  // Game loop
+  useEffect(() => {
+    if (!dodging) return;
+    let raf = 0;
+    const loop = () => {
+      if (!dodgingRef.current) return;
+      // Move
+      const sp = 4;
+      const k = keys.current;
+      setPos(p => {
+        let x = p.x, y = p.y;
+        if (k.has('ArrowLeft') || k.has('a')) x -= sp;
+        if (k.has('ArrowRight') || k.has('d')) x += sp;
+        if (k.has('ArrowUp') || k.has('w')) y -= sp;
+        if (k.has('ArrowDown') || k.has('s')) y += sp;
+        return { x: Math.max(10, Math.min(290, x)), y: Math.max(10, Math.min(190, y)) };
+      });
+      // Move bullets
+      setBullets(bs => bs.map(b => ({ ...b, x: b.x + b.vx, y: b.y + b.vy }))
+        .filter(b => b.x > -50 && b.x < 350 && b.y > -50 && b.y < 250));
+      // Collision
+      if (!invRef.current) {
+        const p = posRef.current;
+        setBullets(bs => {
+          const hit = bs.some(b => {
+            const dx = b.x - p.x, dy = b.y - p.y;
+            return Math.sqrt(dx * dx + dy * dy) < (b.size + 8);
+          });
+          if (hit) {
+            const en = enemyRef.current;
+            const dmg = Math.max(1, (en?.atk || 5) - 8);
+            setHp(h => {
+              const nh = Math.max(0, h - dmg);
+              if (nh <= 0) {
+                setDodging(false);
+                setBullets([]);
+                setTimeout(() => { stopMelody(); setScreen('gameover'); }, 300);
+              }
+              return nh;
+            });
+            setShake(true);
+            setTimeout(() => setShake(false), 200);
+            sfx('hurt');
+            setInvincible(true);
+            setTimeout(() => setInvincible(false), 800);
+          }
+          return bs;
+        });
+      }
+      raf = requestAnimationFrame(loop);
+    };
+    raf = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(raf);
+  }, [dodging]);
 
-    if (battlePhase === 'dialogue') {
-      if (key === 'Enter' || key === ' ') {
-        playSfx('select');
-        setBattlePhase('menu');
-        setMenuSelection(0);
-      }
-      return;
-    }
-    if (battlePhase === 'menu') {
-      if (key === 'ArrowLeft') { setMenuSelection(s => Math.max(0, s - 1)); playSfx('select'); }
-      if (key === 'ArrowRight') { setMenuSelection(s => Math.min(3, s + 1)); playSfx('select'); }
-      if (key === 'Enter' || key === ' ') {
-        playSfx('confirm');
-        if (menuSelection === 0) doFight();
-        else if (menuSelection === 1) setBattlePhase('act');
-        else if (menuSelection === 2) setBattlePhase('item');
-        else if (menuSelection === 3) doMercy();
-      }
-    }
-    if (battlePhase === 'victory') {
-      if (key === 'Enter' || key === ' ') endBattle();
+  // Music
+  useEffect(() => {
+    if (!audioStarted) return;
+    if (screen === 'title') stopMelody();
+    else if (screen === 'battle' && enemy) {
+      if (enemy.name.includes('Principal') || enemy.name.includes('Matěj')) playMelody('boss');
+      else playMelody('battle');
+    } else if (screen === 'overworld') playMelody('overworld');
+    else if (screen === 'ending') playMelody('victory');
+  }, [screen, enemy, audioStarted]);
+
+  // ===== ACTIONS =====
+  const startAudio = () => {
+    if (!audioStarted) {
+      initAudioCtx();
+      setAudioStarted(true);
+      playMelody('menu');
     }
   };
 
-  const doFight = () => {
-    const enemy = currentEnemy;
-    if (!enemy) return;
-    setFightAnim(true);
-    playSfx('attack');
-    const dmg = Math.max(1, player.atk - enemy.def + Math.floor(Math.random() * 5));
-    setDmgNum({ val: dmg });
-    setTimeout(() => setDmgNum(null), 1000);
-    setTimeout(() => {
-      setFightAnim(false);
-      const newHp = Math.max(0, enemy.hp - dmg);
-      setCurrentEnemy({ ...enemy, hp: newHp });
-      setBattleLog([`* Bert attacks! ${dmg} damage!`]);
-      if (newHp <= 0) {
-        setTimeout(() => {
-          setBattleLog([enemy.defeatText]);
-          setBattlePhase('victory');
-          playSfx('confirm');
-        }, 500);
-      } else {
-        setTimeout(() => startEnemyTurn(), 800);
+  const handleEnter = () => {
+    if (screen === 'title') { startAudio(); setScreen('intro'); sfx('confirm'); }
+    else if (screen === 'intro') {
+      sfx('select');
+      if (introIdx < STORY_INTRO.length - 1) setIntroIdx(i => i + 1);
+      else setScreen('overworld');
+    }
+    else if (screen === 'overworld' && dlg.length > 0) {
+      sfx('select');
+      if (dlgIdx < dlg.length - 1) setDlgIdx(i => i + 1);
+      else { setDlg([]); setDlgIdx(0); }
+    }
+    else if (midpoint) {
+      sfx('select');
+      if (midIdx < midText.length - 1) setMidIdx(i => i + 1);
+      else { setMidpoint(false); startBattle(); }
+    }
+    else if (screen === 'battle') {
+      if (bp === 'dialogue') { sfx('select'); setBp('menu'); setMenuSel(0); }
+      else if (bp === 'victory') endBattle();
+      else if (bp === 'menu') {
+        sfx('confirm');
+        if (menuSel === 0) doFight();
+        else if (menuSel === 1) setBp('act');
+        else if (menuSel === 2) setBp('item');
+        else if (menuSel === 3) doMercy();
       }
-    }, 400);
+    }
+    else if (screen === 'gameover') restart();
+    else if (screen === 'ending') { setScreen('title'); stopMelody(); }
+  };
+  handleEnterRef.current = handleEnter;
+
+  const doFight = () => {
+    if (!enemy) return;
+    sfx('attack');
+    const dmg = Math.max(1, 12 - enemy.def + Math.floor(Math.random() * 5));
+    const newHp = Math.max(0, enemy.hp - dmg);
+    setEnemy({ ...enemy, hp: newHp });
+    setLog([`* Bert attacks! ${dmg} damage!`]);
+    if (newHp <= 0) {
+      setTimeout(() => { setLog([enemy.defeatText]); setBp('victory'); sfx('confirm'); }, 600);
+    } else {
+      setTimeout(() => enemyTurn(), 1000);
+    }
   };
 
   const doAct = (idx: number) => {
-    const enemy = currentEnemy;
     if (!enemy) return;
-    playSfx('confirm');
-    const resp = enemy.actResponses[idx] || '* Nothing happens.';
-    setBattleLog([resp]);
-    setBattlePhase('dialogue');
-    if (enemy.spareable) {
-      setCurrentEnemy(prev => prev ? { ...prev, mercyCount: prev.mercyCount + 1 } : null);
-    }
-    // Some acts also deal damage
+    sfx('confirm');
+    setLog([enemy.actResponses[idx] || '* Nothing happens.']);
+    setBp('dialogue');
+    if (enemy.spareable) setEnemy(prev => prev ? { ...prev, mercyCount: prev.mercyCount + 1 } : null);
     if (idx === 0 || idx === 2) {
-      const dmg = Math.floor(player.atk * 0.5);
+      const dmg = Math.floor(12 * 0.5);
       const newHp = Math.max(0, enemy.hp - dmg);
-      setCurrentEnemy(prev => prev ? { ...prev, hp: newHp } : null);
+      setEnemy(prev => prev ? { ...prev, hp: newHp } : null);
       if (newHp <= 0) {
-        setTimeout(() => {
-          setBattleLog([enemy.defeatText]);
-          setBattlePhase('victory');
-        }, 1200);
+        setTimeout(() => { setLog([enemy.defeatText]); setBp('victory'); }, 1200);
         return;
       }
     }
-    setTimeout(() => startEnemyTurn(), 1500);
+    setTimeout(() => enemyTurn(), 1500);
   };
 
   const doMercy = () => {
-    const enemy = currentEnemy;
     if (!enemy) return;
     if (enemy.mercyCount >= enemy.spareThreshold) {
-      setBattleLog([enemy.spareText]);
-      setBattlePhase('victory');
-      playSfx('heal');
+      setLog([enemy.spareText]);
+      setBp('victory');
+      sfx('heal');
     } else {
-      setBattleLog([
-        `* You tried to spare ${enemy.name}... not ready yet.`,
-        `* (Use ACT to weaken its resolve! ${enemy.mercyCount}/${enemy.spareThreshold})`
-      ]);
-      setBattlePhase('dialogue');
-      setTimeout(() => startEnemyTurn(), 2000);
+      setLog([`* Not ready yet. (${enemy.mercyCount}/${enemy.spareThreshold})`]);
+      setBp('dialogue');
+      setTimeout(() => enemyTurn(), 1500);
     }
   };
 
   const useItem = (idx: number) => {
-    if (idx >= inventory.length) return;
-    const item = inventory[idx];
-    setPlayer(p => ({ ...p, hp: Math.min(p.maxHp, p.hp + item.healAmount) }));
-    setInventory(inv => inv.filter((_, i) => i !== idx));
-    setBattleLog([`* Bert used ${item.emoji} ${item.name}! Healed ${item.healAmount} HP!`]);
-    setBattlePhase('dialogue');
-    playSfx('heal');
-    setTimeout(() => startEnemyTurn(), 1500);
+    if (idx >= inv.length) return;
+    const item = inv[idx];
+    setHp(h => Math.min(92, h + item.healAmount));
+    setInv(arr => arr.filter((_, i) => i !== idx));
+    setLog([`* Used ${item.emoji} ${item.name}! +${item.healAmount} HP`]);
+    setBp('dialogue');
+    sfx('heal');
+    setTimeout(() => enemyTurn(), 1200);
   };
 
-  const startEnemyTurn = () => {
-    const enemy = currentEnemy;
+  const enemyTurn = () => {
     if (!enemy) return;
+    setBp('wait');
     const d = enemy.dialogue[Math.floor(Math.random() * enemy.dialogue.length)];
-    setBattleLog([d]);
-    setBattlePhase('transition');
+    setLog([d]);
     setTimeout(() => {
-      const pattern = enemy.attackPatterns[Math.floor(Math.random() * enemy.attackPatterns.length)];
-      setBullets(pattern.bullets.map(b => ({ ...b })));
-      setPlayerPos({ x: 150, y: 100 });
-      setIsDodging(true);
-      setBattlePhase('enemy_turn');
-
-      dodgeTimerRef.current = setTimeout(() => {
-        setIsDodging(false);
+      const pat = enemy.attackPatterns[Math.floor(Math.random() * enemy.attackPatterns.length)];
+      setBullets(pat.bullets.map(b => ({ ...b })));
+      setPos({ x: 150, y: 100 });
+      setDodging(true);
+      setBp('enemy');
+      setTimeout(() => {
+        setDodging(false);
         setBullets([]);
-        setBattlePhase('menu');
-        setMenuSelection(0);
-      }, pattern.duration);
-    }, 1200);
+        setBp('menu');
+        setMenuSel(0);
+      }, pat.duration);
+    }, 1000);
   };
 
-  const beginBattle = () => {
-    const room = ROOMS[currentRoom];
-    if (room.encounters && room.encounters.length > 0) {
-      const ek = room.encounters.find(e => !defeatedEnemies.has(`${currentRoom}_${e}`));
+  const startBattle = () => {
+    const r = ROOMS[room];
+    if (r.encounters) {
+      const ek = r.encounters.find(e => !defeated.has(`${room}_${e}`));
       if (ek) {
-        const enemy = { ...ENEMIES[ek], mercyCount: 0 };
-        setCurrentEnemy(enemy);
-        setBattlePhase('menu');
-        setMenuSelection(0);
-        setBattleLog([enemy.dialogue[0]]);
-        setPlayerPos({ x: 150, y: 100 });
+        const en = { ...ENEMIES[ek], mercyCount: 0 };
+        setEnemy(en);
+        setBp('menu');
+        setMenuSel(0);
+        setLog([en.dialogue[0]]);
+        setPos({ x: 150, y: 100 });
         setBullets([]);
-        setIsDodging(false);
-        setGameState('battle');
-        playSfx('attack');
+        setDodging(false);
+        setScreen('battle');
+        sfx('attack');
         return;
       }
     }
-    setGameState('overworld');
+    setScreen('overworld');
   };
 
   const endBattle = () => {
-    if (currentEnemy) {
-      setDefeatedEnemies(prev => new Set([...prev, `${currentRoom}_${currentEnemy.name}`]));
-      const expGain = Math.floor(currentEnemy.maxHp * 0.5);
-      const goldGain = Math.floor(currentEnemy.maxHp * 0.3);
-      setPlayer(p => ({
-        ...p,
-        exp: p.exp + expGain,
-        gold: p.gold + goldGain,
-        lv: p.exp + expGain >= p.lv * 30 ? p.lv + 1 : p.lv,
-      }));
+    if (enemy) {
+      setDefeated(prev => new Set([...prev, `${room}_${enemy.name}`]));
+      const eg = Math.floor(enemy.maxHp * 0.5);
+      const gg = Math.floor(enemy.maxHp * 0.3);
+      setExp(e => e + eg);
+      setGold(g => g + gg);
+      if (exp + eg >= lv * 30) setLv(l => l + 1);
     }
-    if (currentRoom === 'darkroom') {
-      setGameState('ending');
-    } else {
-      setGameState('overworld');
-    }
-    setCurrentEnemy(null);
-    setBattleLog([]);
+    if (room === 'darkroom') setScreen('ending');
+    else setScreen('overworld');
+    setEnemy(null);
+    setLog([]);
     setBullets([]);
-    setIsDodging(false);
+    setDodging(false);
   };
 
-  const moveToRoom = (roomId: string) => {
-    // Add party on hallway
-    if (roomId === 'hallway' && !visitedRooms.has('hallway')) {
-      setDialogue([
+  const goToRoom = (id: string) => {
+    if (id === 'hallway' && !visited.has('hallway')) {
+      setDlg([
         "* Martin and Kája join your party!",
         "* Martin: 'Dude, this is either awesome or terrifying.'",
         "* Kája: 'Statistically? Both.'",
-        "* Your party has formed! Fight together!",
       ]);
-      setDialogueIndex(0);
+      setDlgIdx(0);
     }
-
-    setCurrentRoom(roomId);
-    setVisitedRooms(prev => new Set([...prev, roomId]));
-    playSfx('confirm');
-
-    // Check midpoint story
-    if (STORY_MIDPOINTS[roomId] && !visitedRooms.has(roomId)) {
-      setMidpointText(STORY_MIDPOINTS[roomId]);
-      setMidpointIdx(0);
-      setShowMidpoint(true);
+    setRoom(id);
+    setVisited(prev => new Set([...prev, id]));
+    sfx('confirm');
+    if (STORY_MIDPOINTS[id] && !visited.has(id)) {
+      setMidText(STORY_MIDPOINTS[id]);
+      setMidIdx(0);
+      setMidpoint(true);
       return;
     }
-
-    // Check encounters
-    const room = ROOMS[roomId];
-    if (room.encounters && room.encounters.some(e => !defeatedEnemies.has(`${roomId}_${e}`))) {
+    const r = ROOMS[id];
+    if (r.encounters && r.encounters.some(e => !defeated.has(`${id}_${e}`))) {
       setTimeout(() => {
-        const ek = room.encounters!.find(e => !defeatedEnemies.has(`${roomId}_${e}`));
+        const ek = r.encounters!.find(e => !defeated.has(`${id}_${e}`));
         if (ek) {
-          const enemy = { ...ENEMIES[ek], mercyCount: 0 };
-          setCurrentEnemy(enemy);
-          setBattlePhase('menu');
-          setMenuSelection(0);
-          setBattleLog([enemy.dialogue[0]]);
-          setPlayerPos({ x: 150, y: 100 });
+          const en = { ...ENEMIES[ek], mercyCount: 0 };
+          setEnemy(en);
+          setBp('menu');
+          setMenuSel(0);
+          setLog([en.dialogue[0]]);
+          setPos({ x: 150, y: 100 });
           setBullets([]);
-          setIsDodging(false);
-          setGameState('battle');
-          playSfx('attack');
+          setDodging(false);
+          setScreen('battle');
+          sfx('attack');
         }
-      }, 200);
+      }, 100);
     }
   };
 
-  const collectItem = (room: string, idx: number) => {
+  const takeItem = (idx: number) => {
     const key = `${room}_${idx}`;
-    if (collectedItems.has(key)) return;
+    if (collected.has(key)) return;
     const item = ROOMS[room].items![idx];
-    setInventory(inv => [...inv, item]);
-    setCollectedItems(prev => new Set([...prev, key]));
-    setDialogue([`* Found ${item.emoji} ${item.name}!`, `* ${item.description}`]);
-    setDialogueIndex(0);
-    playSfx('heal');
+    setInv(arr => [...arr, item]);
+    setCollected(prev => new Set([...prev, key]));
+    setDlg([`* Found ${item.emoji} ${item.name}!`]);
+    setDlgIdx(0);
+    sfx('heal');
   };
 
-  const restartGame = () => {
-    setGameState('title');
-    setIntroIndex(0);
-    setCurrentRoom('classroom');
-    setDialogue([]);
-    setDialogueIndex(0);
-    setInventory([]);
-    setPlayer({ hp: BERT_MAX_HP, maxHp: BERT_MAX_HP, atk: BERT_ATK, def: BERT_DEF, lv: 1, exp: 0, gold: 0 });
-    setCurrentEnemy(null);
-    setBattlePhase('menu');
-    setMenuSelection(0);
-    setBattleLog([]);
+  const restart = () => {
+    setScreen('title');
+    setIntroIdx(0);
+    setRoom('classroom');
+    setDlg([]);
+    setDlgIdx(0);
+    setInv([]);
+    setHp(92);
+    setLv(1);
+    setExp(0);
+    setGold(0);
+    setEnemy(null);
+    setBp('menu');
+    setMenuSel(0);
+    setLog([]);
     setBullets([]);
-    setPlayerPos({ x: 150, y: 100 });
-    setIsDodging(false);
-    setVisitedRooms(new Set(['classroom']));
-    setDefeatedEnemies(new Set());
-    setCollectedItems(new Set());
+    setPos({ x: 150, y: 100 });
+    setDodging(false);
+    setVisited(new Set(['classroom']));
+    setDefeated(new Set());
+    setCollected(new Set());
     stopMelody();
-    setAudioOn(false);
+    setAudioStarted(false);
   };
 
-  const handleVol = (v: number) => { setVol(v); setVolume(v); };
-
-  const room = ROOMS[currentRoom];
+  const R = ROOMS[room];
 
   // ===== RENDER =====
   return (
-    <div
-      className={`w-full h-screen bg-black flex flex-col items-center justify-center overflow-hidden select-none ${shake ? 'animate-shake' : ''}`}
-      style={{ fontFamily: "'Courier New', monospace" }}
-    >
-      {/* Volume */}
-      <div className="absolute top-2 right-2 z-50 flex items-center gap-2">
-        <span className="text-yellow-400 text-xs">🔊</span>
-        <input type="range" min="0" max="1" step="0.1" value={volume}
-          onChange={e => handleVol(parseFloat(e.target.value))}
-          className="w-16 h-2 accent-yellow-400" />
-      </div>
-
-      {/* ===== TITLE ===== */}
-      {gameState === 'title' && (
-        <div className="text-center cursor-pointer relative" onClick={startAudio}>
-          <div className="absolute inset-0 overflow-hidden pointer-events-none">
-            {Array.from({ length: 20 }, (_, i) => (
-              <div key={i} className="absolute w-1 h-1 bg-white rounded-full"
-                style={{
-                  left: `${Math.random() * 100}%`, top: `${Math.random() * 100}%`,
-                  animation: `twinkle ${1.5 + Math.random() * 2}s ease-in-out infinite`,
-                  animationDelay: `${Math.random() * 3}s`,
-                }} />
-            ))}
-          </div>
-          <div className="relative z-10">
-            <div className="text-7xl mb-6" style={{ animation: 'float 3s ease-in-out infinite' }}>🏫</div>
-            <h1 className="text-4xl md:text-5xl font-bold text-yellow-400 mb-2 tracking-wider"
-              style={{ textShadow: '0 0 10px #ffaa00, 0 0 20px #ff6600' }}>
-              BERTARUNE
-            </h1>
-            <p className="text-base md:text-lg text-blue-300 mb-2">✦ A School Dark World Adventure ✦</p>
-            <p className="text-sm text-purple-400 mb-8 italic">"Determination fills the hallway..."</p>
-            <div className="text-xs md:text-sm text-gray-400 mb-6 space-y-1">
-              <p>📍 Church Gymnasium of the Teutonic Order</p>
-              <p className="mt-3 text-gray-300">Party:</p>
-              <div className="flex justify-center gap-2 mt-2 flex-wrap text-xs">
-                <span className="text-blue-400">🧑‍🎓 Bert</span>
-                <span className="text-red-400">👦 Martin</span>
-                <span className="text-pink-400">👧 Kája</span>
-                <span className="text-orange-400">👦 Dan</span>
-                <span className="text-purple-400">😈 Matěj</span>
-                <span className="text-green-400">🧒 Šíma</span>
-              </div>
-            </div>
-            <p className="text-yellow-300 animate-bounce mt-8 text-base md:text-lg">
-              ▶ Click or Press ENTER to Start ◀
-            </p>
-            <div className="mt-6 text-xs text-gray-600">
-              <p>Arrow Keys / WASD: Move | Enter: Confirm</p>
+    <div className={`w-full h-screen bg-black flex items-center justify-center overflow-auto ${shake ? 'animate-shake' : ''}`}
+      style={{ fontFamily: "'Courier New', monospace" }}>
+      
+      {/* TITLE */}
+      {screen === 'title' && (
+        <div className="text-center p-8 cursor-pointer" onClick={() => { startAudio(); setScreen('intro'); sfx('confirm'); }}>
+          <div className="text-7xl mb-6 animate-bounce">🏫</div>
+          <h1 className="text-4xl font-bold text-yellow-400 mb-2" style={{ textShadow: '0 0 10px #ffaa00' }}>
+            BERTARUNE
+          </h1>
+          <p className="text-blue-300 mb-2">✦ A School Dark World Adventure ✦</p>
+          <p className="text-purple-400 text-sm italic mb-6">"Determination fills the hallway..."</p>
+          <div className="text-gray-400 text-sm mb-4">
+            <p>📍 Church Gymnasium of the Teutonic Order</p>
+            <div className="flex justify-center gap-2 mt-3 flex-wrap text-xs">
+              <span className="text-blue-400">🧑‍🎓 Bert</span>
+              <span className="text-red-400">👦 Martin</span>
+              <span className="text-pink-400">👧 Kája</span>
+              <span className="text-orange-400">👦 Dan</span>
+              <span className="text-purple-400">😈 Matěj</span>
+              <span className="text-green-400">🧒 Šíma</span>
             </div>
           </div>
+          <p className="text-yellow-300 animate-pulse mt-6">▶ Click or Press ENTER ◀</p>
         </div>
       )}
 
-      {/* ===== INTRO ===== */}
-      {gameState === 'intro' && (
-        <div className="w-full max-w-2xl p-4 md:p-8 cursor-pointer"
-          onClick={() => {
-            playSfx('select');
-            if (introIndex < STORY_INTRO.length - 1) setIntroIndex(i => i + 1);
-            else setGameState('overworld');
-          }}>
-          <div className="border-4 border-white p-6 bg-black min-h-[160px] flex items-center">
-            <p className="text-white text-sm md:text-lg leading-relaxed">{STORY_INTRO[introIndex]}</p>
+      {/* INTRO */}
+      {screen === 'intro' && (
+        <div className="w-full max-w-2xl p-6 cursor-pointer" onClick={handleEnter}>
+          <div className="border-4 border-white p-6 bg-black min-h-[150px] flex items-center">
+            <p className="text-white text-base leading-relaxed">{STORY_INTRO[introIdx]}</p>
           </div>
-          <p className="text-gray-500 text-xs mt-4 text-center animate-pulse">
-            [ Click or ENTER ] ({introIndex + 1}/{STORY_INTRO.length})
+          <p className="text-gray-500 text-xs mt-3 text-center animate-pulse">
+            [Click/Enter] ({introIdx + 1}/{STORY_INTRO.length})
           </p>
         </div>
       )}
 
-      {/* ===== MIDPOINT ===== */}
-      {showMidpoint && (
-        <div className="w-full max-w-2xl p-4 md:p-8 cursor-pointer"
-          onClick={() => {
-            playSfx('select');
-            if (midpointIdx < midpointText.length - 1) setMidpointIdx(i => i + 1);
-            else { setShowMidpoint(false); beginBattle(); }
-          }}>
-          <div className="border-4 border-purple-500 p-6 bg-black min-h-[160px] flex items-center">
-            <p className="text-purple-200 text-sm md:text-lg leading-relaxed">{midpointText[midpointIdx]}</p>
+      {/* MIDPOINT */}
+      {midpoint && (
+        <div className="w-full max-w-2xl p-6 cursor-pointer" onClick={handleEnter}>
+          <div className="border-4 border-purple-500 p-6 bg-black min-h-[150px] flex items-center">
+            <p className="text-purple-200 text-base leading-relaxed">{midText[midIdx]}</p>
           </div>
-          <p className="text-gray-500 text-xs mt-4 text-center animate-pulse">[ Click or ENTER ]</p>
+          <p className="text-gray-500 text-xs mt-3 text-center animate-pulse">[Click/Enter]</p>
         </div>
       )}
 
-      {/* ===== OVERWORLD ===== */}
-      {gameState === 'overworld' && !showMidpoint && (
-        <div className="w-full max-w-3xl p-3 md:p-4 overflow-y-auto max-h-screen">
-          <div className="border-2 border-yellow-600 p-3 mb-4 relative" style={{ backgroundColor: room.bg }}>
-            <h2 className="text-yellow-400 text-lg md:text-xl font-bold mb-1">📍 {room.name}</h2>
-            <p className="text-gray-300 text-xs md:text-sm">{room.description}</p>
+      {/* OVERWORLD */}
+      {screen === 'overworld' && !midpoint && (
+        <div className="w-full max-w-3xl p-4 overflow-y-auto max-h-screen">
+          <div className="border-2 border-yellow-600 p-3 mb-3" style={{ backgroundColor: R.bg }}>
+            <h2 className="text-yellow-400 text-lg font-bold mb-1">📍 {R.name}</h2>
+            <p className="text-gray-300 text-sm">{R.description}</p>
           </div>
 
-          {room.npcs?.map((npc, i) => (
-            <button key={i} onClick={() => { setDialogue(npc.dialogue); setDialogueIndex(0); playSfx('select'); }}
-              className="flex items-center gap-3 p-3 border-2 border-gray-700 hover:border-yellow-400 w-full text-left transition-colors bg-gray-900 hover:bg-gray-800 mb-2">
-              <span className="text-2xl md:text-3xl">{npc.sprite}</span>
-              <span style={{ color: npc.color }} className="font-bold text-sm md:text-base">{npc.name}</span>
+          {R.npcs?.map((npc, i) => (
+            <button key={i} onClick={() => { setDlg(npc.dialogue); setDlgIdx(0); sfx('select'); }}
+              className="flex items-center gap-3 p-3 border-2 border-gray-700 hover:border-yellow-400 w-full text-left bg-gray-900 hover:bg-gray-800 mb-2 transition-colors">
+              <span className="text-2xl">{npc.sprite}</span>
+              <span style={{ color: npc.color }} className="font-bold">{npc.name}</span>
               <span className="text-gray-500 text-xs ml-auto">[Talk]</span>
             </button>
           ))}
 
-          {room.items?.map((item, i) => {
-            if (collectedItems.has(`${currentRoom}_${i}`)) return null;
+          {R.items?.map((item, i) => {
+            if (collected.has(`${room}_${i}`)) return null;
             return (
-              <button key={i} onClick={() => collectItem(currentRoom, i)}
-                className="flex items-center gap-3 p-3 border-2 border-green-800 hover:border-green-400 w-full text-left transition-colors bg-gray-900 hover:bg-gray-800 mb-2">
+              <button key={i} onClick={() => takeItem(i)}
+                className="flex items-center gap-3 p-3 border-2 border-green-800 hover:border-green-400 w-full text-left bg-gray-900 hover:bg-gray-800 mb-2 transition-colors">
                 <span className="text-xl">{item.emoji}</span>
-                <span className="text-green-400 text-sm">{item.name}</span>
+                <span className="text-green-400">{item.name}</span>
                 <span className="text-gray-500 text-xs ml-auto">[Take]</span>
               </button>
             );
           })}
 
-          {dialogue.length > 0 && (
-            <div className="border-4 border-white p-4 mt-3 bg-black cursor-pointer"
-              onClick={() => {
-                playSfx('select');
-                if (dialogueIndex < dialogue.length - 1) setDialogueIndex(i => i + 1);
-                else { setDialogue([]); setDialogueIndex(0); }
-              }}>
-              <p className="text-white text-sm">{dialogue[dialogueIndex]}</p>
-              <p className="text-gray-500 text-xs mt-2">[Click] ({dialogueIndex + 1}/{dialogue.length})</p>
+          {dlg.length > 0 && (
+            <div className="border-4 border-white p-4 mt-3 bg-black cursor-pointer" onClick={handleEnter}>
+              <p className="text-white text-sm">{dlg[dlgIdx]}</p>
+              <p className="text-gray-500 text-xs mt-2">[Click/Enter] ({dlgIdx + 1}/{dlg.length})</p>
             </div>
           )}
 
           <div className="mt-4 border-t border-gray-700 pt-3">
             <p className="text-gray-500 text-xs mb-2">Go to:</p>
             <div className="flex flex-wrap gap-2">
-              {room.exits.map((exit, i) => (
-                <button key={i} onClick={() => moveToRoom(exit.roomId)}
-                  className="px-3 py-2 border-2 border-blue-600 text-blue-400 hover:bg-blue-900 hover:text-white transition-colors text-xs md:text-sm">
-                  {exit.label}
+              {R.exits.map((ex, i) => (
+                <button key={i} onClick={() => goToRoom(ex.roomId)}
+                  className="px-3 py-2 border-2 border-blue-600 text-blue-400 hover:bg-blue-900 hover:text-white text-sm transition-colors">
+                  {ex.label}
                 </button>
               ))}
             </div>
@@ -618,110 +539,72 @@ export default function App() {
 
           <div className="mt-4 border-2 border-gray-700 p-3 bg-gray-900">
             <div className="flex justify-between items-center">
-              <div className="flex items-center gap-2">
-                <span className="text-xl">🧑‍🎓</span>
-                <div>
-                  <p className="text-white font-bold text-sm">Bert <span className="text-yellow-400 text-xs">LV {player.lv}</span></p>
-                  <p className="text-xs">
-                    <span className="text-yellow-400">HP </span>
-                    <span className={player.hp < player.maxHp * 0.3 ? 'text-red-400' : 'text-green-400'}>
-                      {player.hp}/{player.maxHp}
-                    </span>
-                  </p>
-                </div>
+              <div>
+                <p className="text-white font-bold text-sm">🧑‍🎓 Bert <span className="text-yellow-400 text-xs">LV {lv}</span></p>
+                <p className="text-xs">
+                  <span className="text-yellow-400">HP </span>
+                  <span className={hp < 28 ? 'text-red-400' : 'text-green-400'}>{hp}/92</span>
+                </p>
               </div>
               <div className="text-right text-xs text-gray-500">
-                <p>ATK:{player.atk} DEF:{player.def}</p>
-                <p>EXP:{player.exp} Gold:{player.gold}</p>
-                <p>Items:{inventory.length}</p>
+                <p>EXP:{exp} Gold:{gold}</p>
+                <p>Items:{inv.length}</p>
               </div>
             </div>
           </div>
         </div>
       )}
 
-      {/* ===== BATTLE ===== */}
-      {gameState === 'battle' && currentEnemy && (
-        <div className="w-full max-w-3xl p-3 md:p-4">
-          {/* Enemy */}
-          <div className="text-center mb-3 border-2 border-gray-700 p-3 md:p-4 relative overflow-hidden"
-            style={{ background: `linear-gradient(180deg, ${currentEnemy.color}22 0%, #111 100%)` }}>
-            <div className={`text-5xl md:text-6xl mb-2 ${fightAnim ? 'animate-bounce' : ''}`}
-              style={{ filter: currentEnemy.hp < currentEnemy.maxHp * 0.3 ? 'hue-rotate(180deg) brightness(1.5)' : 'none' }}>
-              {currentEnemy.sprite}
-            </div>
-            <h3 className="text-base md:text-xl font-bold" style={{ color: currentEnemy.color }}>{currentEnemy.name}</h3>
+      {/* BATTLE */}
+      {screen === 'battle' && enemy && (
+        <div className="w-full max-w-3xl p-3">
+          <div className="text-center mb-3 border-2 border-gray-700 p-3" style={{ background: `linear-gradient(180deg, ${enemy.color}22, #111)` }}>
+            <div className="text-5xl mb-2">{enemy.sprite}</div>
+            <h3 className="text-lg font-bold" style={{ color: enemy.color }}>{enemy.name}</h3>
             <div className="mt-2 flex items-center justify-center gap-2">
               <span className="text-red-400 text-xs">HP</span>
-              <div className="w-32 md:w-48 h-3 md:h-4 bg-gray-800 border border-gray-600">
-                <div className="h-full bg-red-500 transition-all duration-300"
-                  style={{ width: `${(currentEnemy.hp / currentEnemy.maxHp) * 100}%` }} />
+              <div className="w-40 h-3 bg-gray-800 border border-gray-600">
+                <div className="h-full bg-red-500 transition-all" style={{ width: `${(enemy.hp / enemy.maxHp) * 100}%` }} />
               </div>
-              <span className="text-gray-400 text-xs">{currentEnemy.hp}/{currentEnemy.maxHp}</span>
+              <span className="text-gray-400 text-xs">{enemy.hp}/{enemy.maxHp}</span>
             </div>
-            {currentEnemy.spareable && (
-              <div className="mt-2">
+            {enemy.spareable && (
+              <div className="mt-1">
                 <div className="flex items-center justify-center gap-1">
                   <span className="text-yellow-600 text-xs">MERCY:</span>
                   <div className="w-20 h-2 bg-gray-800 border border-gray-600">
-                    <div className="h-full bg-yellow-500 transition-all"
-                      style={{ width: `${Math.min(100, (currentEnemy.mercyCount / currentEnemy.spareThreshold) * 100)}%` }} />
+                    <div className="h-full bg-yellow-500 transition-all" style={{ width: `${Math.min(100, (enemy.mercyCount / enemy.spareThreshold) * 100)}%` }} />
                   </div>
                 </div>
-                {currentEnemy.mercyCount >= currentEnemy.spareThreshold && (
-                  <p className="text-yellow-400 text-xs mt-1 animate-pulse">★ SPAREABLE ★</p>
-                )}
+                {enemy.mercyCount >= enemy.spareThreshold && <p className="text-yellow-400 text-xs animate-pulse">★ SPAREABLE ★</p>}
               </div>
             )}
           </div>
 
-          {/* Battle Box */}
-          <div className="relative w-full border-4 border-white bg-black mx-auto mb-3 overflow-hidden"
-            style={{ maxWidth: '300px', height: '200px' }}>
-            {isDodging ? (
+          <div className="relative w-full border-4 border-white bg-black mx-auto mb-3 overflow-hidden" style={{ maxWidth: '300px', height: '200px' }}>
+            {dodging ? (
               <>
                 <div className={`absolute text-red-500 text-lg ${invincible ? 'opacity-30' : ''}`}
-                  style={{ left: playerPos.x - 8, top: playerPos.y - 8, transition: 'opacity 0.1s' }}>
-                  ❤
-                </div>
+                  style={{ left: pos.x - 8, top: pos.y - 8, transition: 'opacity 0.1s' }}>❤</div>
                 {bullets.map((b, i) => (
-                  <div key={i} className="absolute"
-                    style={{
-                      left: b.x - b.size / 2, top: b.y - b.size / 2,
-                      width: b.size, height: b.size,
-                      backgroundColor: b.color,
-                      borderRadius: b.shape === 'circle' ? '50%' : b.shape === 'diamond' ? '0' : '2px',
-                      transform: b.shape === 'diamond' ? 'rotate(45deg)' : 'none',
-                      boxShadow: `0 0 4px ${b.color}`,
-                    }} />
+                  <div key={i} className="absolute" style={{
+                    left: b.x - b.size / 2, top: b.y - b.size / 2, width: b.size, height: b.size,
+                    backgroundColor: b.color,
+                    borderRadius: b.shape === 'circle' ? '50%' : b.shape === 'diamond' ? '0' : '2px',
+                    transform: b.shape === 'diamond' ? 'rotate(45deg)' : 'none',
+                    boxShadow: `0 0 4px ${b.color}`,
+                  }} />
                 ))}
               </>
             ) : (
-              <div className="p-3 h-full flex items-center justify-center relative">
-                {dmgNum && (
-                  <div className="absolute text-red-500 text-2xl font-bold animate-damage pointer-events-none"
-                    style={{ left: '130px', top: '40px' }}>
-                    {dmgNum.val}
-                  </div>
-                )}
+              <div className="p-3 h-full flex items-center justify-center">
                 <div className="text-center">
-                  {battleLog.map((log, i) => (
-                    <p key={i} className="text-white text-xs md:text-sm mb-1">{log}</p>
-                  ))}
-                  {battlePhase === 'dialogue' && (
-                    <p className="text-gray-500 text-xs mt-2 animate-pulse cursor-pointer"
-                      onClick={() => { playSfx('select'); setBattlePhase('menu'); setMenuSelection(0); }}>
-                      [Click/ENTER]
-                    </p>
-                  )}
-                  {battlePhase === 'victory' && (
+                  {log.map((l, i) => <p key={i} className="text-white text-sm mb-1">{l}</p>)}
+                  {bp === 'dialogue' && <p className="text-gray-500 text-xs mt-2 animate-pulse cursor-pointer" onClick={handleEnter}>[Click/Enter]</p>}
+                  {bp === 'victory' && (
                     <div className="mt-3">
-                      <p className="text-yellow-400 animate-pulse cursor-pointer" onClick={endBattle}>
-                        [Click/ENTER to continue]
-                      </p>
-                      <p className="text-green-400 text-xs mt-2">
-                        +{Math.floor(currentEnemy.maxHp * 0.5)} EXP | +{Math.floor(currentEnemy.maxHp * 0.3)} Gold
-                      </p>
+                      <p className="text-yellow-400 animate-pulse cursor-pointer" onClick={endBattle}>[Click/Enter to continue]</p>
+                      <p className="text-green-400 text-xs mt-2">+{Math.floor(enemy.maxHp * 0.5)} EXP | +{Math.floor(enemy.maxHp * 0.3)} Gold</p>
                     </div>
                   )}
                 </div>
@@ -729,148 +612,111 @@ export default function App() {
             )}
           </div>
 
-          {/* Player HP */}
-          <div className="mb-3 px-1">
+          <div className="mb-3">
             <div className="flex items-center gap-2">
-              <span className="text-yellow-400 text-xs w-20">🧑‍🎓 Bert</span>
+              <span className="text-yellow-400 text-xs w-16">🧑‍🎓 Bert</span>
               <div className="flex-1 h-3 bg-gray-800 border border-gray-600">
-                <div className={`h-full transition-all duration-300 ${player.hp < player.maxHp * 0.3 ? 'bg-red-500' : player.hp < player.maxHp * 0.6 ? 'bg-yellow-500' : 'bg-green-500'}`}
-                  style={{ width: `${(player.hp / player.maxHp) * 100}%` }} />
+                <div className={`h-full transition-all ${hp < 28 ? 'bg-red-500' : hp < 55 ? 'bg-yellow-500' : 'bg-green-500'}`}
+                  style={{ width: `${(hp / 92) * 100}%` }} />
               </div>
-              <span className={`text-xs w-16 text-right ${player.hp < player.maxHp * 0.3 ? 'text-red-400' : 'text-green-400'}`}>
-                {player.hp}/{player.maxHp}
-              </span>
+              <span className={`text-xs w-14 text-right ${hp < 28 ? 'text-red-400' : 'text-green-400'}`}>{hp}/92</span>
             </div>
           </div>
 
-          {/* Battle Menu */}
-          {!isDodging && battlePhase !== 'victory' && battlePhase !== 'dialogue' && battlePhase !== 'transition' && (
+          {!dodging && bp !== 'victory' && bp !== 'dialogue' && bp !== 'wait' && (
             <div className="border-2 border-yellow-600 p-3 bg-gray-900">
-              {battlePhase === 'menu' && (
+              {bp === 'menu' && (
                 <div className="flex justify-around flex-wrap gap-2">
                   {['⚔️ FIGHT', '💬 ACT', '🎒 ITEM', '💛 MERCY'].map((opt, i) => (
-                    <button key={i}
-                      onClick={() => {
-                        playSfx('confirm');
-                        setMenuSelection(i);
-                        if (i === 0) doFight();
-                        else if (i === 1) setBattlePhase('act');
-                        else if (i === 2) setBattlePhase('item');
-                        else if (i === 3) doMercy();
-                      }}
-                      className={`px-2 py-2 border-2 text-xs transition-all ${menuSelection === i
-                        ? 'border-yellow-400 text-yellow-400 bg-yellow-900/30 scale-105'
-                        : 'border-gray-600 text-gray-400 hover:border-gray-400'}`}>
-                      {menuSelection === i && '❤ '}{opt}
+                    <button key={i} onClick={() => {
+                      sfx('confirm');
+                      setMenuSel(i);
+                      if (i === 0) doFight();
+                      else if (i === 1) setBp('act');
+                      else if (i === 2) setBp('item');
+                      else if (i === 3) doMercy();
+                    }} className={`px-2 py-2 border-2 text-xs transition-all ${menuSel === i ? 'border-yellow-400 text-yellow-400 bg-yellow-900/30' : 'border-gray-600 text-gray-400 hover:border-gray-400'}`}>
+                      {menuSel === i && '❤ '}{opt}
                     </button>
                   ))}
                 </div>
               )}
-              {battlePhase === 'act' && currentEnemy && (
+              {bp === 'act' && (
                 <div className="space-y-1">
-                  <button onClick={() => setBattlePhase('menu')} className="text-blue-400 hover:text-blue-200 text-xs mb-2">← Back</button>
-                  {currentEnemy.acts.map((act, i) => (
+                  <button onClick={() => setBp('menu')} className="text-blue-400 text-xs mb-2">← Back</button>
+                  {enemy.acts.map((act, i) => (
                     <button key={i} onClick={() => doAct(i)}
-                      className="block w-full text-left px-3 py-2 border border-gray-700 text-gray-400 hover:border-yellow-400 hover:text-yellow-400 transition-all text-sm">
+                      className="block w-full text-left px-3 py-2 border border-gray-700 text-gray-400 hover:border-yellow-400 hover:text-yellow-400 text-sm transition-colors">
                       {act}
                     </button>
                   ))}
                 </div>
               )}
-              {battlePhase === 'item' && (
+              {bp === 'item' && (
                 <div className="space-y-1">
-                  <button onClick={() => setBattlePhase('menu')} className="text-blue-400 hover:text-blue-200 text-xs mb-2">← Back</button>
-                  {inventory.length === 0 ? (
-                    <p className="text-gray-500 text-sm px-3">No items!</p>
-                  ) : inventory.map((item, i) => (
-                    <button key={i} onClick={() => useItem(i)}
-                      className="block w-full text-left px-3 py-2 border border-gray-700 text-gray-400 hover:border-yellow-400 hover:text-yellow-400 transition-all text-sm">
-                      {item.emoji} {item.name} (+{item.healAmount}HP)
-                    </button>
-                  ))}
+                  <button onClick={() => setBp('menu')} className="text-blue-400 text-xs mb-2">← Back</button>
+                  {inv.length === 0 ? <p className="text-gray-500 text-sm">No items!</p> :
+                    inv.map((item, i) => (
+                      <button key={i} onClick={() => useItem(i)}
+                        className="block w-full text-left px-3 py-2 border border-gray-700 text-gray-400 hover:border-yellow-400 hover:text-yellow-400 text-sm transition-colors">
+                        {item.emoji} {item.name} (+{item.healAmount}HP)
+                      </button>
+                    ))}
                 </div>
               )}
             </div>
           )}
 
-          {isDodging && (
-            <p className="text-center text-gray-500 text-xs mt-2">
-              Arrow Keys / WASD to dodge! ❤ = you!
-            </p>
-          )}
-
-          {/* Touch controls for mobile */}
-          {isDodging && (
-            <div className="flex flex-col items-center gap-1 mt-3 md:hidden">
-              <button onTouchStart={() => keysRef.current.add('ArrowUp')}
-                onTouchEnd={() => keysRef.current.delete('ArrowUp')}
-                className="w-12 h-10 bg-gray-800 border-2 border-gray-600 rounded text-white active:bg-gray-600">▲</button>
-              <div className="flex gap-1">
-                <button onTouchStart={() => keysRef.current.add('ArrowLeft')}
-                  onTouchEnd={() => keysRef.current.delete('ArrowLeft')}
-                  className="w-12 h-10 bg-gray-800 border-2 border-gray-600 rounded text-white active:bg-gray-600">◀</button>
-                <div className="w-12" />
-                <button onTouchStart={() => keysRef.current.add('ArrowRight')}
-                  onTouchEnd={() => keysRef.current.delete('ArrowRight')}
-                  className="w-12 h-10 bg-gray-800 border-2 border-gray-600 rounded text-white active:bg-gray-600">▶</button>
+          {dodging && (
+            <>
+              <p className="text-center text-gray-500 text-xs mt-2">Arrow Keys / WASD to dodge! ❤ = you</p>
+              <div className="flex flex-col items-center gap-1 mt-2 md:hidden">
+                <button onTouchStart={() => keys.current.add('ArrowUp')} onTouchEnd={() => keys.current.delete('ArrowUp')}
+                  className="w-12 h-10 bg-gray-800 border-2 border-gray-600 rounded text-white active:bg-gray-600">▲</button>
+                <div className="flex gap-1">
+                  <button onTouchStart={() => keys.current.add('ArrowLeft')} onTouchEnd={() => keys.current.delete('ArrowLeft')}
+                    className="w-12 h-10 bg-gray-800 border-2 border-gray-600 rounded text-white active:bg-gray-600">◀</button>
+                  <div className="w-12" />
+                  <button onTouchStart={() => keys.current.add('ArrowRight')} onTouchEnd={() => keys.current.delete('ArrowRight')}
+                    className="w-12 h-10 bg-gray-800 border-2 border-gray-600 rounded text-white active:bg-gray-600">▶</button>
+                </div>
+                <button onTouchStart={() => keys.current.add('ArrowDown')} onTouchEnd={() => keys.current.delete('ArrowDown')}
+                  className="w-12 h-10 bg-gray-800 border-2 border-gray-600 rounded text-white active:bg-gray-600">▼</button>
               </div>
-              <button onTouchStart={() => keysRef.current.add('ArrowDown')}
-                onTouchEnd={() => keysRef.current.delete('ArrowDown')}
-                className="w-12 h-10 bg-gray-800 border-2 border-gray-600 rounded text-white active:bg-gray-600">▼</button>
-            </div>
+            </>
           )}
         </div>
       )}
 
-      {/* ===== GAME OVER ===== */}
-      {gameState === 'gameover' && (
-        <div className="text-center cursor-pointer p-8" onClick={restartGame}>
-          <div className="text-6xl mb-6 animate-bounce" style={{ animationDuration: '2s' }}>💔</div>
+      {/* GAME OVER */}
+      {screen === 'gameover' && (
+        <div className="text-center p-8 cursor-pointer" onClick={restart}>
+          <div className="text-6xl mb-6 animate-bounce">💔</div>
           <h2 className="text-3xl text-red-500 font-bold mb-4" style={{ textShadow: '0 0 20px #ff0000' }}>GAME OVER</h2>
-          <div className="border-2 border-red-900 p-4 bg-black/80 max-w-sm mx-auto mb-6">
-            <p className="text-gray-300 text-sm mb-2">* Bert's heart has stopped...</p>
-            <p className="text-gray-400 text-sm mb-2">* But determination fills you.</p>
-            <p className="text-red-400 text-sm italic">* "I can't give up. My friends need me."</p>
+          <div className="border-2 border-red-900 p-4 bg-black max-w-sm mx-auto mb-6">
+            <p className="text-gray-300 text-sm mb-2">* Bert's heart stopped...</p>
+            <p className="text-red-400 text-sm italic">* "But determination fills you."</p>
           </div>
-          <p className="text-yellow-400 animate-pulse">[ Click or ENTER to try again ]</p>
+          <p className="text-yellow-400 animate-pulse">[Click/Enter to retry]</p>
         </div>
       )}
 
-      {/* ===== ENDING ===== */}
-      {gameState === 'ending' && (
-        <div className="w-full max-w-2xl p-4 md:p-6 text-center cursor-pointer overflow-y-auto max-h-screen"
-          onClick={() => { setGameState('title'); stopMelody(); }}>
-          <div className="text-6xl mb-4" style={{ animation: 'float 3s ease-in-out infinite' }}>🌟</div>
-          <h2 className="text-3xl text-yellow-400 font-bold mb-4"
-            style={{ textShadow: '0 0 10px #ffaa00, 0 0 20px #ffaa00' }}>
-            ✦ VICTORY! ✦
-          </h2>
-          <div className="border-4 border-yellow-600 p-4 md:p-6 bg-gray-900/95 text-left mb-4 text-sm">
+      {/* ENDING */}
+      {screen === 'ending' && (
+        <div className="w-full max-w-2xl p-4 text-center cursor-pointer overflow-y-auto max-h-screen"
+          onClick={() => { setScreen('title'); stopMelody(); }}>
+          <div className="text-6xl mb-4 animate-bounce">🌟</div>
+          <h2 className="text-3xl text-yellow-400 font-bold mb-4" style={{ textShadow: '0 0 10px #ffaa00' }}>✦ VICTORY! ✦</h2>
+          <div className="border-4 border-yellow-600 p-4 bg-gray-900 text-left mb-4 text-sm">
             <p className="text-white mb-2">* The darkness fades from the school...</p>
             <p className="text-white mb-2">* The Principal returns to normal.</p>
-            <p className="text-white mb-2">* Principal: "I... what happened? Why so many detention slips?"</p>
-            <p className="text-white mb-2">* Matěj shakes off the corruption.</p>
-            <p className="text-white mb-2">* Matěj: "Dude, that was WILD. Again sometime?"</p>
-            <p className="text-white mb-2">* Kája: "Absolutely not. Chemistry test tomorrow."</p>
-            <p className="text-white mb-2">* Martin: "I learned something today..."</p>
-            <p className="text-white mb-2">* Dan: "Yeah? What?"</p>
-            <p className="text-white mb-2">* Martin: "My jokes are so bad they defeat evil."</p>
-            <p className="text-white mb-2">* Šíma: "The supply closet is normal again!"</p>
+            <p className="text-white mb-2">* Matěj: "Dude, that was WILD!"</p>
+            <p className="text-white mb-2">* Kája: "I have a chemistry test tomorrow."</p>
+            <p className="text-white mb-2">* Martin: "My jokes defeat evil."</p>
             <p className="text-white mb-2">* Bert smiles. Another day saved.</p>
-            <p className="text-yellow-400 mt-3 text-center font-bold">✦ THE END...? ✦</p>
+            <p className="text-yellow-400 mt-3 text-center font-bold">✦ THE END ✦</p>
           </div>
-          <div className="text-xs text-gray-400 mb-3 border border-gray-700 p-2 bg-black/50">
-            <p>Bert LV {player.lv} | EXP: {player.exp} | Gold: {player.gold}</p>
-            <p>Rooms: {visitedRooms.size}/{Object.keys(ROOMS).length} | Defeated: {defeatedEnemies.size}</p>
-          </div>
-          <p className="text-yellow-300 animate-pulse">[ Click or ENTER ]</p>
-        </div>
-      )}
-
-      {/* Footer */}
-      {gameState !== 'title' && (
-        <div className="absolute bottom-1 left-2 text-xs text-gray-700 hidden md:block">
-          <p>Arrows/WASD: Move | Enter: Confirm | Esc: Back</p>
+          <p className="text-yellow-300 animate-pulse">[Click/Enter]</p>
         </div>
       )}
     </div>
